@@ -79,6 +79,19 @@ services:
     networks:
       - consensus-net
 
+  raft-node-4:
+    build: ./raft
+    container_name: raft-node-4
+    environment:
+      - NODE_ID=node-4
+      - PORT=8000
+      - PEERS=node-4=http://raft-node-4:8000
+    ports:
+      - "9004:8000"
+    networks:
+      - consensus-net
+
+
 networks:
   consensus-net:
     driver: bridge

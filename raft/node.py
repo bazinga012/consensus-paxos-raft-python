@@ -15,12 +15,19 @@ PORT = int(os.environ.get("PORT", "8000"))
 
 # Parse peers environment variable
 PEERS_ENV = os.environ.get("PEERS", "")
-peers: Dict[str, str] = {}
+INITIAL_PEERS: Dict[str, str] = {}
 if PEERS_ENV:
     for item in PEERS_ENV.split(","):
         if "=" in item:
             name, url = item.split("=", 1)
-            peers[name] = url
+            INITIAL_PEERS[name] = url
+
+# Helper to dynamically get the active configuration from the replicated log
+def get_active_peers() -> Dict[str, str]:
+    for entry in reversed(log_data):
+        if entry.get("type") == "CONFIG":
+            return entry["peers"]
+    return INITIAL_PEERS
 
 # Terminal colors for visual logs
 COLORS = {
@@ -55,7 +62,7 @@ current_term = 0
 voted_for: Optional[str] = None
 
 # Log starts with a sentinel at index 0 (1-based index support)
-log_data: List[dict] = [{"term": 0, "command": "SENTINEL"}]
+log_data: List[dict] = [{"term": 0, "command": "SENTINEL", "type": "WRITE"}]
 
 commit_index = 0
 last_applied = 0
@@ -114,6 +121,12 @@ async def request_vote(req: RequestVoteRequest):
     check_term(req.term)
 
     global current_term, voted_for, last_rpc_time, election_timeout
+
+    # Check if candidate is in active configuration
+    active_peers = get_active_peers()
+    if req.candidate_id not in active_peers:
+        log(f"Rejecting vote to {req.candidate_id}: not in active configuration", "FOLLOWER")
+        return {"term": current_term, "vote_granted": False}
 
     # 1. Reply false if term < currentTerm
     if req.term < current_term:
@@ -214,14 +227,14 @@ async def write(req: WriteRequest):
         )
 
     # Append locally
-    new_entry = {"term": current_term, "command": req.value}
+    new_entry = {"term": current_term, "command": req.value, "type": "WRITE"}
     log_data.append(new_entry)
     new_index = len(log_data) - 1
     log(f"Appended local log index {new_index}: '{req.value}'", "LEADER")
-
+ 
     # Trigger immediate replication
     await replicate_log()
-
+ 
     # Wait for replication/commit to complete
     timeout = 4.0
     start_time = time.time()
@@ -236,8 +249,72 @@ async def write(req: WriteRequest):
         await asyncio.sleep(0.1)
         if role != "LEADER" or is_down:
             raise HTTPException(status_code=500, detail="Lost leadership during replication")
-
+ 
     raise HTTPException(status_code=500, detail="Write timeout: failed to replicate to majority")
+
+class ChangeMembershipRequest(BaseModel):
+    node_id: str
+    node_url: str
+    action: str  # "ADD" or "REMOVE"
+
+@app.post("/membership/change")
+async def change_membership(req: ChangeMembershipRequest):
+    check_status()
+    global commit_index
+
+    if role != "LEADER":
+        raise HTTPException(
+            status_code=307,
+            detail={
+                "status": "redirect",
+                "leader": last_known_leader,
+                "msg": f"Node {NODE_ID} is not the Leader"
+            }
+        )
+
+    active_peers = get_active_peers()
+    new_peers = active_peers.copy()
+
+    if req.action == "ADD":
+        new_peers[req.node_id] = req.node_url
+        log(f"Leader proposing to ADD node {req.node_id} ({req.node_url})", "LEADER")
+    elif req.action == "REMOVE":
+        new_peers.pop(req.node_id, None)
+        log(f"Leader proposing to REMOVE node {req.node_id}", "LEADER")
+    else:
+        raise HTTPException(status_code=400, detail="Invalid action. Use ADD or REMOVE.")
+
+    # Create config change log entry
+    new_entry = {
+        "term": current_term,
+        "type": "CONFIG",
+        "peers": new_peers,
+        "command": f"CONFIG_{req.action}_{req.node_id}"
+    }
+
+    # Append locally
+    log_data.append(new_entry)
+    new_index = len(log_data) - 1
+
+    # Trigger immediate replication
+    await replicate_log()
+
+    # Wait for the configuration change to be committed
+    timeout = 5.0
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        if commit_index >= new_index:
+            return {
+                "status": "success",
+                "index": new_index,
+                "term": current_term,
+                "peers": new_peers
+            }
+        await asyncio.sleep(0.1)
+        if role != "LEADER" or is_down:
+            raise HTTPException(status_code=500, detail="Lost leadership during configuration change")
+
+    raise HTTPException(status_code=500, detail="Configuration change timeout: failed to commit")
 
 async def send_rpc(peer_id: str, url: str, payload: dict) -> Optional[dict]:
     if peer_id in blocked_peers or is_down:
@@ -261,11 +338,18 @@ async def replicate_log():
     if role != "LEADER" or is_down:
         return
 
+    active_peers = get_active_peers()
+    # Initialize next_index and match_index for any newly discovered peers
+    for pid in active_peers:
+        if pid not in next_index:
+            next_index[pid] = len(log_data)
+            match_index[pid] = 0
+
     tasks = []
-    active_peers = {pid: url for pid, url in peers.items() if pid not in blocked_peers}
-    
     for peer_id, peer_url in active_peers.items():
         if peer_id == NODE_ID:
+            continue
+        if peer_id in blocked_peers:
             continue
         tasks.append(replicate_to_peer(peer_id, peer_url))
 
@@ -315,13 +399,14 @@ async def replicate_to_peer(peer_id: str, peer_url: str):
 
 def check_commit_index():
     global commit_index
-    majority = (len(peers) // 2) + 1
+    active_peers = get_active_peers()
+    majority = (len(active_peers) // 2) + 1
     
     for N in range(len(log_data) - 1, commit_index, -1):
         # Raft leader only commits entries of its own term directly
         if log_data[N]["term"] == current_term:
             count = 1  # count leader self
-            for pid in peers:
+            for pid in active_peers:
                 if pid != NODE_ID and match_index.get(pid, 0) >= N:
                     count += 1
             if count >= majority:
@@ -355,15 +440,17 @@ async def start_election():
     log(f"Starting election for term {current_term}", "CANDIDATE")
     votes = 1
 
-    tasks = []
-    active_peers = {pid: url for pid, url in peers.items() if pid not in blocked_peers}
-    
-    last_log_idx = len(log_data) - 1
-    last_log_term = log_data[last_log_idx]["term"]
+    active_peers = get_active_peers()
+    majority = (len(active_peers) // 2) + 1
 
+    tasks = []
     for peer_id, peer_url in active_peers.items():
         if peer_id == NODE_ID:
             continue
+        if peer_id in blocked_peers:
+            continue
+        last_log_idx = len(log_data) - 1
+        last_log_term = log_data[last_log_idx]["term"]
         tasks.append(send_rpc(peer_id, f"{peer_url}/request_vote", {
             "sender_id": NODE_ID,
             "term": current_term,
@@ -384,12 +471,11 @@ async def start_election():
         if role == "CANDIDATE" and res.get("vote_granted"):
             votes += 1
 
-    majority = (len(peers) // 2) + 1
     if role == "CANDIDATE" and votes >= majority:
         role = "LEADER"
         log(f"Became Leader for term {current_term}", "LEADER")
-        # Initialize nextIndex and matchIndex
-        for pid in peers:
+        # Initialize nextIndex and matchIndex for all active peers
+        for pid in active_peers:
             next_index[pid] = len(log_data)
             match_index[pid] = 0
         # Replicate heartbeats immediately
@@ -405,9 +491,10 @@ async def run_heartbeat_loop():
 
 @app.on_event("startup")
 async def startup_event():
-    # Make sure self is in peers list for self-references
-    if NODE_ID not in peers:
-        peers[NODE_ID] = f"http://localhost:{PORT}"
+    # Make sure self is in INITIAL_PEERS list for self-references
+    global INITIAL_PEERS
+    if NODE_ID not in INITIAL_PEERS:
+        INITIAL_PEERS[NODE_ID] = f"http://localhost:{PORT}"
     
     # Start timer loops in the background
     asyncio.create_task(run_election_timeout_loop())
