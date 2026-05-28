@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  # --------------------
+  # Paxos Cluster
+  # --------------------
+  paxos-node-1:
+    build: ./paxos
+    container_name: paxos-node-1
+    environment:
+      - NODE_ID=node-1
+      - PORT=8000
+      - PEERS=node-1=http://paxos-node-1:8000,node-2=http://paxos-node-2:8000,node-3=http://paxos-node-3:8000
+    ports:
+      - "8001:8000"
+    networks:
+      - consensus-net
+
+  paxos-node-2:
+    build: ./paxos
+    container_name: paxos-node-2
+    environment:
+      - NODE_ID=node-2
+      - PORT=8000
+      - PEERS=node-1=http://paxos-node-1:8000,node-2=http://paxos-node-2:8000,node-3=http://paxos-node-3:8000
+    ports:
+      - "8002:8000"
+    networks:
+      - consensus-net
+
+  paxos-node-3:
+    build: ./paxos
+    container_name: paxos-node-3
+    environment:
+      - NODE_ID=node-3
+      - PORT=8000
+      - PEERS=node-1=http://paxos-node-1:8000,node-2=http://paxos-node-2:8000,node-3=http://paxos-node-3:8000
+    ports:
+      - "8003:8000"
+    networks:
+      - consensus-net
+
+  # --------------------
+  # Raft Cluster
+  # --------------------
+  raft-node-1:
+    build: ./raft
+    container_name: raft-node-1
+    environment:
+      - NODE_ID=node-1
+      - PORT=8000
+      - PEERS=node-1=http://raft-node-1:8000,node-2=http://raft-node-2:8000,node-3=http://raft-node-3:8000
+    ports:
+      - "9001:8000"
+    networks:
+      - consensus-net
+
+  raft-node-2:
+    build: ./raft
+    container_name: raft-node-2
+    environment:
+      - NODE_ID=node-2
+      - PORT=8000
+      - PEERS=node-1=http://raft-node-1:8000,node-2=http://raft-node-2:8000,node-3=http://raft-node-3:8000
+    ports:
+      - "9002:8000"
+    networks:
+      - consensus-net
+
+  raft-node-3:
+    build: ./raft
+    container_name: raft-node-3
+    environment:
+      - NODE_ID=node-3
+      - PORT=8000
+      - PEERS=node-1=http://raft-node-1:8000,node-2=http://raft-node-2:8000,node-3=http://raft-node-3:8000
+    ports:
+      - "9003:8000"
+    networks:
+      - consensus-net
+
+networks:
+  consensus-net:
+    driver: bridge
