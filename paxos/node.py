@@ -3,7 +3,7 @@ import os
 import sys
 import random
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any, Union
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 import httpx
@@ -15,12 +15,38 @@ PORT = int(os.environ.get("PORT", "8000"))
 
 # Parse peers environment variable (e.g. "node-1=http://node-1:8000,node-2=http://node-2:8000")
 PEERS_ENV = os.environ.get("PEERS", "")
-peers: Dict[str, str] = {}
+INITIAL_PEERS: Dict[str, str] = {}
 if PEERS_ENV:
     for item in PEERS_ENV.split(","):
         if "=" in item:
             name, url = item.split("=", 1)
-            peers[name] = url
+            INITIAL_PEERS[name] = url
+
+# Helper to dynamically retrieve the configuration active for a given slot index
+def get_config_for_index(idx: int) -> dict:
+    for i in range(idx - 1, -1, -1):
+        if i in committed_v and committed_v[i] is not None:
+            entry = committed_v[i]
+            if isinstance(entry, dict) and entry.get("type") in ("CONFIG", "CONFIG_JOINT"):
+                return entry
+    return {"type": "CONFIG", "peers": INITIAL_PEERS}
+
+# Helper to check if responding nodes satisfy configuration quorums (supporting joint consensus)
+def check_quorum(config: dict, responses: list) -> bool:
+    if config["type"] == "CONFIG":
+        active_peers = config["peers"]
+        majority = (len(active_peers) // 2) + 1
+        votes = sum(1 for pid in responses if pid in active_peers)
+        return votes >= majority
+    elif config["type"] == "CONFIG_JOINT":
+        old_peers = config["old_peers"]
+        new_peers = config["new_peers"]
+        majority_old = (len(old_peers) // 2) + 1
+        majority_new = (len(new_peers) // 2) + 1
+        votes_old = sum(1 for pid in responses if pid in old_peers)
+        votes_new = sum(1 for pid in responses if pid in new_peers)
+        return votes_old >= majority_old and votes_new >= majority_new
+    return False
 
 # Terminal colors for visual logs
 COLORS = {
@@ -81,12 +107,12 @@ class AcceptRequest(BaseModel):
     sender_id: str
     index: int
     n: List
-    v: str
+    v: Any
 
 class CommitRequest(BaseModel):
     sender_id: str
     index: int
-    v: str
+    v: Any
 
 # Helper to check if node can process requests
 def check_status(sender_id: Optional[str] = None):
@@ -176,14 +202,131 @@ async def commit(req: CommitRequest):
 # Client and Control API
 # -----------------
 
+async def propose_value_at_index(idx: int, val: Any) -> dict:
+    global proposal_counter
+    attempts = 0
+    while attempts < 10:
+        attempts += 1
+        if idx in committed_v and committed_v[idx] is not None:
+            committed_val = committed_v[idx]
+            if isinstance(val, dict) and isinstance(committed_val, dict):
+                if committed_val.get("command") == val.get("command"):
+                    return {"status": "success", "index": idx, "value": val}
+            elif committed_val == val:
+                return {"status": "success", "index": idx, "value": val}
+            log(f"Index {idx} already committed to '{committed_val}'. Advancing index.", "PROPOSER")
+            idx += 1
+            continue
+
+        n = [proposal_counter, NODE_ID]
+        proposal_counter += 1
+
+        # Get configuration active for this slot
+        config = get_config_for_index(idx)
+        if config["type"] == "CONFIG":
+            target_peers = config["peers"]
+        elif config["type"] == "CONFIG_JOINT":
+            # Union of old and new peers
+            target_peers = {**config["old_peers"], **config["new_peers"]}
+        else:
+            target_peers = INITIAL_PEERS
+
+        log(f"Phase 1a: Sending Prepare(index={idx}, n={n}) using config {config['type']}", "PROPOSER")
+
+        # Send prepares to active target peers
+        tasks = []
+        active_targets = {pid: url for pid, url in target_peers.items() if pid not in blocked_peers}
+        for peer_id, peer_url in active_targets.items():
+            tasks.append(send_rpc(peer_id, f"{peer_url}/prepare", {"sender_id": NODE_ID, "index": idx, "n": n}))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        promises = []
+        successful_responders = []
+        rejects = 0
+        max_rejected_n = [-1, ""]
+
+        for peer_id, res in zip(active_targets.keys(), results):
+            if isinstance(res, Exception) or res is None:
+                continue
+            if res.get("status") == "promise":
+                promises.append(res)
+                successful_responders.append(peer_id)
+            elif res.get("status") == "reject":
+                rejects += 1
+                if res.get("max_n", [-1, ""]) > max_rejected_n:
+                    max_rejected_n = res["max_n"]
+
+        # Check quorum based on config
+        if not check_quorum(config, successful_responders):
+            log(f"Phase 1a failed: No quorum promise reached. Retrying.", "PROPOSER")
+            if max_rejected_n[0] >= proposal_counter:
+                proposal_counter = max_rejected_n[0] + 1
+            await asyncio.sleep(random.uniform(0.1, 0.4))
+            continue
+
+        # Find highest accepted value
+        highest_accepted_n = [-1, ""]
+        chosen_v = val
+        for p in promises:
+            acc_n = p.get("accepted_n")
+            acc_v = p.get("accepted_v")
+            if acc_n and acc_n > highest_accepted_n:
+                highest_accepted_n = acc_n
+                chosen_v = acc_v
+
+        if chosen_v != val:
+            log(f"Phase 1a resolved: Index {idx} has already accepted value. Adopting it.", "PROPOSER")
+        else:
+            log(f"Phase 1a resolved: No accepted value. Proposing our value.", "PROPOSER")
+
+        # Phase 2a: Send accept
+        log(f"Phase 2a: Sending Accept(index={idx}, n={n}) using config {config['type']}", "PROPOSER")
+        tasks = []
+        for peer_id, peer_url in active_targets.items():
+            tasks.append(send_rpc(peer_id, f"{peer_url}/accept", {"sender_id": NODE_ID, "index": idx, "n": n, "v": chosen_v}))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        accept_responders = []
+        max_rejected_n = [-1, ""]
+
+        for peer_id, res in zip(active_targets.keys(), results):
+            if isinstance(res, Exception) or res is None:
+                continue
+            if res.get("status") == "accepted":
+                accept_responders.append(peer_id)
+            elif res.get("status") == "reject":
+                if res.get("max_n", [-1, ""]) > max_rejected_n:
+                    max_rejected_n = res["max_n"]
+
+        if not check_quorum(config, accept_responders):
+            log(f"Phase 2a failed: No quorum acceptance reached. Retrying.", "PROPOSER")
+            if max_rejected_n[0] >= proposal_counter:
+                proposal_counter = max_rejected_n[0] + 1
+            await asyncio.sleep(random.uniform(0.1, 0.4))
+            continue
+
+        # Phase 3: Commit!
+        log(f"Phase 2a success! Committing value at index {idx}", "PROPOSER")
+        tasks = []
+        for peer_id, peer_url in active_targets.items():
+            tasks.append(send_rpc(peer_id, f"{peer_url}/commit", {"sender_id": NODE_ID, "index": idx, "v": chosen_v}))
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        if chosen_v == val:
+            return {"status": "success", "index": idx, "value": val}
+        else:
+            idx += 1
+            continue
+
+    raise HTTPException(status_code=500, detail="Failed to reach consensus after max attempts")
+
 class WriteRequest(BaseModel):
     value: str
 
 @app.post("/write")
 async def write(req: WriteRequest):
     check_status()
-    global proposal_counter
-
     async with propose_lock:
         val = req.value
         idx = 0
@@ -192,112 +335,72 @@ async def write(req: WriteRequest):
             idx += 1
 
         log(f"Received write request for '{val}'. Proposing at index {idx}", "PROPOSER")
+        return await propose_value_at_index(idx, val)
 
-        attempts = 0
-        while attempts < 10:
-            attempts += 1
-            if idx in committed_v and committed_v[idx] is not None:
-                if committed_v[idx] == val:
-                    return {"status": "success", "index": idx, "value": val}
-                log(f"Index {idx} already committed to '{committed_v[idx]}'. Advancing index.", "PROPOSER")
-                idx += 1
-                continue
+class ChangeMembershipRequest(BaseModel):
+    node_id: str
+    node_url: str
+    action: str  # "ADD" or "REMOVE"
 
-            n = [proposal_counter, NODE_ID]
-            proposal_counter += 1
+@app.post("/membership/change")
+async def change_membership(req: ChangeMembershipRequest):
+    check_status()
+    async with propose_lock:
+        idx = 0
+        while idx in committed_v and committed_v[idx] is not None:
+            idx += 1
 
-            log(f"Phase 1a: Sending Prepare(index={idx}, n={n})", "PROPOSER")
+        log(f"Received Paxos membership change: {req.action} {req.node_id}. Proposing at index {idx}", "PROPOSER")
 
-            # Send prepares to all active peers
-            tasks = []
-            active_peers = {pid: url for pid, url in peers.items() if pid not in blocked_peers}
-            # Include self in the active peers representation implicitly (processed locally or via self HTTP call)
-            for peer_id, peer_url in active_peers.items():
-                tasks.append(send_rpc(peer_id, f"{peer_url}/prepare", {"sender_id": NODE_ID, "index": idx, "n": n}))
+        # 1. Get current configuration
+        current_config = get_config_for_index(idx)
+        if current_config["type"] != "CONFIG":
+            raise HTTPException(status_code=400, detail="Cannot change membership while another change is in progress")
 
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+        old_peers = current_config["peers"].copy()
+        new_peers = old_peers.copy()
+        if req.action == "ADD":
+            new_peers[req.node_id] = req.node_url
+        elif req.action == "REMOVE":
+            new_peers.pop(req.node_id, None)
+        else:
+            raise HTTPException(status_code=400, detail="Invalid action")
 
-            promises = []
-            rejects = 0
-            max_rejected_n = [-1, ""]
+        # 2. Phase A: Propose CONFIG_JOINT at index idx
+        joint_config = {
+            "type": "CONFIG_JOINT",
+            "old_peers": old_peers,
+            "new_peers": new_peers,
+            "command": f"CONFIG_JOINT_{req.action}_{req.node_id}"
+        }
 
-            for res in results:
-                if isinstance(res, Exception) or res is None:
-                    continue
-                if res.get("status") == "promise":
-                    promises.append(res)
-                elif res.get("status") == "reject":
-                    rejects += 1
-                    if res.get("max_n", [-1, ""]) > max_rejected_n:
-                        max_rejected_n = res["max_n"]
+        res = await propose_value_at_index(idx, joint_config)
+        if res.get("status") != "success":
+            raise HTTPException(status_code=500, detail="Failed to commit Joint Configuration")
 
-            # Majority of all configured peers
-            majority = (len(peers) // 2) + 1
-            if len(promises) < majority:
-                log(f"Phase 1a failed: Got only {len(promises)} promises (majority: {majority}). Retrying.", "PROPOSER")
-                if max_rejected_n[0] >= proposal_counter:
-                    proposal_counter = max_rejected_n[0] + 1
-                await asyncio.sleep(random.uniform(0.1, 0.4))
-                continue
+        # 3. Phase B: Propose CONFIG_NEW at index idx + 1
+        idx_new = idx + 1
+        while idx_new in committed_v and committed_v[idx_new] is not None:
+            idx_new += 1
 
-            # We have a majority promise! Find if any acceptor already accepted a value.
-            highest_accepted_n = [-1, ""]
-            chosen_v = val
-            for p in promises:
-                acc_n = p.get("accepted_n")
-                acc_v = p.get("accepted_v")
-                if acc_n and acc_n > highest_accepted_n:
-                    highest_accepted_n = acc_n
-                    chosen_v = acc_v
+        final_config = {
+            "type": "CONFIG",
+            "peers": new_peers,
+            "command": f"CONFIG_NEW_{req.action}_{req.node_id}"
+        }
 
-            if chosen_v != val:
-                log(f"Phase 1a resolved: Index {idx} has already accepted value '{chosen_v}' by proposal {highest_accepted_n}", "PROPOSER")
-            else:
-                log(f"Phase 1a resolved: No accepted value. Proposing our client value '{val}'", "PROPOSER")
+        res2 = await propose_value_at_index(idx_new, final_config)
+        if res2.get("status") != "success":
+            raise HTTPException(status_code=500, detail="Failed to commit Final Configuration")
 
-            # Phase 2a: Send accept
-            log(f"Phase 2a: Sending Accept(index={idx}, n={n}, v={chosen_v})", "PROPOSER")
-            tasks = []
-            for peer_id, peer_url in active_peers.items():
-                tasks.append(send_rpc(peer_id, f"{peer_url}/accept", {"sender_id": NODE_ID, "index": idx, "n": n, "v": chosen_v}))
+        return {
+            "status": "success",
+            "joint_index": idx,
+            "final_index": idx_new,
+            "peers": new_peers
+        }
 
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            accepts = 0
-            max_rejected_n = [-1, ""]
-
-            for res in results:
-                if isinstance(res, Exception) or res is None:
-                    continue
-                if res.get("status") == "accepted":
-                    accepts += 1
-                elif res.get("status") == "reject":
-                    if res.get("max_n", [-1, ""]) > max_rejected_n:
-                        max_rejected_n = res["max_n"]
-
-            if accepts < majority:
-                log(f"Phase 2a failed: Got only {accepts} accepts (majority: {majority}). Retrying.", "PROPOSER")
-                if max_rejected_n[0] >= proposal_counter:
-                    proposal_counter = max_rejected_n[0] + 1
-                await asyncio.sleep(random.uniform(0.1, 0.4))
-                continue
-
-            # Phase 3: Commit!
-            log(f"Phase 2a success! Committing value '{chosen_v}' at index {idx}", "PROPOSER")
-            tasks = []
-            for peer_id, peer_url in active_peers.items():
-                tasks.append(send_rpc(peer_id, f"{peer_url}/commit", {"sender_id": NODE_ID, "index": idx, "v": chosen_v}))
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-            if chosen_v == val:
-                return {"status": "success", "index": idx, "value": val}
-            else:
-                # We committed another proposer's value; we must try our value in the next slot
-                idx += 1
-                continue
-
-        raise HTTPException(status_code=500, detail="Failed to reach consensus after max attempts")
-
-# Send RPC helper
+# Helper to check if sending to self to bypass network
 async def send_rpc(peer_id: str, url: str, payload: dict) -> Optional[dict]:
     # Simulate network block
     if peer_id in blocked_peers or is_down:
@@ -366,6 +469,7 @@ async def chaos_up():
     return {"status": "up"}
 
 # Helper to fill holes from other nodes
+# Helper to fill holes from other nodes
 async def fill_holes_from_peers():
     # Find all holes in log_list (indices < len(log_list) where value is None)
     holes = [i for i, val in enumerate(log_list) if val is None]
@@ -373,7 +477,15 @@ async def fill_holes_from_peers():
         return
     
     # Query active peers for their committed state
-    active_peers = {pid: url for pid, url in peers.items() if pid not in blocked_peers}
+    config = get_config_for_index(len(log_list))
+    if config["type"] == "CONFIG":
+        peers_dict = config["peers"]
+    elif config["type"] == "CONFIG_JOINT":
+        peers_dict = {**config["old_peers"], **config["new_peers"]}
+    else:
+        peers_dict = INITIAL_PEERS
+
+    active_peers = {pid: url for pid, url in peers_dict.items() if pid not in blocked_peers}
     for peer_id, peer_url in active_peers.items():
         if peer_id == NODE_ID:
             continue
@@ -404,9 +516,10 @@ async def run_sync_loop():
 
 @app.on_event("startup")
 async def startup_event():
-    # Make sure self is in peers list
-    if NODE_ID not in peers:
-        peers[NODE_ID] = f"http://localhost:{PORT}"
+    # Make sure self is in INITIAL_PEERS list
+    global INITIAL_PEERS
+    if NODE_ID not in INITIAL_PEERS:
+        INITIAL_PEERS[NODE_ID] = f"http://localhost:{PORT}"
     asyncio.create_task(run_sync_loop())
 
 if __name__ == "__main__":

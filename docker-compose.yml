@@ -40,6 +40,19 @@ services:
     networks:
       - consensus-net
 
+  paxos-node-4:
+    build: ./paxos
+    container_name: paxos-node-4
+    environment:
+      - NODE_ID=node-4
+      - PORT=8000
+      - PEERS=node-4=http://paxos-node-4:8000
+    ports:
+      - "8004:8000"
+    networks:
+      - consensus-net
+
+
   # --------------------
   # Raft Cluster
   # --------------------
